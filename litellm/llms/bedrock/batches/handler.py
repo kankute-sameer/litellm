@@ -2,7 +2,7 @@
 Bedrock Batches API Handler
 """
 
-from typing import Any, Coroutine, Optional, Union, cast
+from typing import Any, Coroutine, Dict, Optional, Union, cast
 
 import httpx
 
@@ -19,6 +19,7 @@ from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
     get_async_httpx_client,
 )
+from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 
 from litellm.types.utils import LiteLLMBatch
 from ..base_aws_llm import BaseAWSLLM
@@ -51,16 +52,15 @@ class BedrockBatchesAPI(BaseAWSLLM):
         self,
         _is_async: bool,
         create_batch_data: CreateBatchRequest,
-        api_key: Optional[str],
-        api_base: Optional[str],
-        api_version: Optional[str],
         timeout: Union[float, httpx.Timeout],
         max_retries: Optional[int],
-        organization: Optional[str],
+        litellm_params: Optional[Dict[str, Any]] = None,
+        api_base: Optional[str]=None,
+        logging_obj: Optional[LiteLLMLoggingObj] = None,
         client: Optional[Union[AsyncHTTPHandler, HTTPHandler]] = None,
     ) -> LiteLLMBatch:
         # Build boto3 client via existing BaseAWSLLM credential helpers
-        from litellm.llms.bedrock.common_utils import init_bedrock_client
+        from litellm.llms.bedrock.common_utils import init_bedrock_service_client
 
         # Derive input/output S3 URIs from the input_file_id returned by files.create
         file_id = create_batch_data.get("input_file_id")
@@ -79,21 +79,23 @@ class BedrockBatchesAPI(BaseAWSLLM):
         
         bucket = path_parts[0]
         
-        # Extract model_id - it should be the last path component (folder name)
-        if len(path_parts) >= 2:
-            model_id = path_parts[-1]  # Last part is the model_id
-            # Input S3 URI is the full path up to the model_id folder
-            input_s3_uri = file_id if file_id.endswith("/") else file_id + "/"
-        else:
-            # Only bucket, no model_id
-            model_id = ""
-            input_s3_uri = f"s3://{bucket}/"
+        # Use the S3 URI as-is for input (points to the JSONL file)
+        input_s3_uri = file_id
+        
+        # Extract model ID from the S3 path where it was embedded by the file transformation
+        # Expected format: s3://bucket/model_id/filename.jsonl
+        model_id = create_batch_data.get("model") or ""
+        
+        if not model_id and len(path_parts) >= 3:
+            # Extract model_id from S3 path (it's the second-to-last component before filename)
+            model_id = path_parts[-2]  # Get model_id from the path
+            print(f"Extracted model_id from S3 path: {model_id}")
             
         if not isinstance(input_s3_uri, str) or not input_s3_uri.startswith("s3://"):
             raise ValueError("input_file_id must be an s3:// URI for Bedrock batch jobs")
 
-        # output path: same path as input but without the filename (ensure trailing slash)
-        # s3://bucket/path/to/file.jsonl -> s3://bucket/path/to/
+        # output path: same directory as input file (without the filename)
+        # s3://bucket/model_id/file.jsonl -> s3://bucket/model_id/
         try:
             without_scheme = input_s3_uri[len("s3://"):]
             bucket_and_key = without_scheme.split("/", 1)
@@ -102,11 +104,21 @@ class BedrockBatchesAPI(BaseAWSLLM):
                 output_s3_uri = f"s3://{bucket_and_key[0]}/"
             else:
                 bucket, key = bucket_and_key[0], bucket_and_key[1]
-                prefix = key.rsplit("/", 1)[0] if "/" in key else ""
-                output_s3_uri = f"s3://{bucket}/{prefix}/"
+                # If key contains a filename (has extension), remove it to get directory
+                if "." in key and "/" in key:
+                    # Remove filename to get directory path
+                    prefix = key.rsplit("/", 1)[0]
+                    output_s3_uri = f"s3://{bucket}/{prefix}/"
+                elif "/" in key:
+                    # Already a directory path
+                    prefix = key.rstrip("/")
+                    output_s3_uri = f"s3://{bucket}/{prefix}/"
+                else:
+                    # Key is just a filename or single component
+                    output_s3_uri = f"s3://{bucket}/"
         except Exception:
             # Fallback to bucket root if parsing fails
-            output_s3_uri = input_s3_uri.split("/", 3)[0] + "//" + input_s3_uri.split("/", 3)[2] + "/"
+            output_s3_uri = f"s3://{bucket}/"
 
         # Optional role from config
         s3_params = getattr(litellm, "s3_callback_params", {}) or {}
@@ -114,20 +126,21 @@ class BedrockBatchesAPI(BaseAWSLLM):
         if isinstance(role_arn, str) and not role_arn.startswith("arn:"):
             role_arn = None
 
-        # Ensure the model is set in the create_batch_data if we extracted it from file_id
-        if model_id and not create_batch_data.get("model"):
+        # Ensure the model is set in the create_batch_data 
+        if model_id:
             create_batch_data = dict(create_batch_data)  # Make a copy
             create_batch_data["model"] = model_id
-            
+
         bedrock_job_request: CreateModelInvocationJobRequest = transform_openai_create_batch_to_bedrock_job_request(
             create_batch_data,
             s3_input_uri=input_s3_uri,
             s3_output_uri=output_s3_uri,
             role_arn=role_arn,
         )
+        print(f"create_batch_data: {bedrock_job_request}")
 
         # Create boto3 client (respects env/profile/role)
-        boto_client = init_bedrock_client()
+        boto_client = init_bedrock_service_client()
         resp = boto_client.create_model_invocation_job(**bedrock_job_request)  # type: ignore
         job_arn = resp.get("jobArn")
 
