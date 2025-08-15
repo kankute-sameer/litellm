@@ -61,7 +61,6 @@ class BedrockFilesHandler(BaseLLMHTTPHandler):
                 create_file_data=create_file_data,
                 litellm_params=litellm_params,
             )
-            print(f"s3_upload_params: {s3_upload_params}")
 
             # Actually upload the file to S3 using boto3
             try:
@@ -122,6 +121,7 @@ class BedrockFilesHandler(BaseLLMHTTPHandler):
             raw_response=upload_response,
             logging_obj=logging_obj,
             litellm_params=litellm_params,
+            model_id=s3_upload_params["model_id"],
         )
 
     def create_file(

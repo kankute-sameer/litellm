@@ -69,13 +69,35 @@ class BedrockJsonlFilesTransformation(BaseAWSLLM):
         # Build object key (deterministic path using model if present; fallback to uuid)
         extracted = extract_file_data(data.get("file"))
         filename = extracted.get("filename") or "upload.jsonl"
-        object_key = f"{base_path.rstrip('/') + '/' if base_path else ''}{uuid.uuid4()}-{filename}"
+        
+        # For batch files, infer model_id and include it in the object key
+        model_id = ""
+        if data.get("purpose") == "batch":
+            content = extracted.get("content")
+            if content:
+                if isinstance(content, bytes):
+                    content_str = content.decode("utf-8")
+                elif isinstance(content, str):
+                    content_str = content
+                elif hasattr(content, "read"):
+                    content_str = content.read().decode("utf-8") if isinstance(content.read(), bytes) else content.read()
+                else:
+                    content_str = ""
+                
+                model_id = self.infer_model_id_from_openai_jsonl(content_str) or ""
+        
+        # Include model_id in object key for batch files to enable proper batch processing
+        if model_id:
+            object_key = f"{base_path.rstrip('/') + '/' if base_path else ''}{model_id}/{uuid.uuid4()}-{filename}"
+        else:
+            object_key = f"{base_path.rstrip('/') + '/' if base_path else ''}{uuid.uuid4()}-{filename}"
 
-        # Store object key for response transformation
+        # Store values for response transformation
         self._s3_bucket = bucket
         self._s3_region = region
         self._s3_endpoint_url = endpoint_url
         self._s3_object_key = object_key
+        self._model_id = model_id
 
         if endpoint_url:
             return f"{endpoint_url}/{object_key}"
@@ -173,6 +195,17 @@ class BedrockJsonlFilesTransformation(BaseAWSLLM):
         content = extracted.get("content")
         print(f"content: {content}")
         content_type = extracted.get("content_type") or "application/octet-stream"
+        
+        # For batch files, assume JSONL content type if purpose is batch
+        filename = extracted.get("filename") or ""
+        if create_file_data.get("purpose") == "batch":
+            # Try to detect if it's JSONL content
+            if filename.endswith(".jsonl") or content_type in ["application/jsonl", "text/jsonl"]:
+                content_type = "application/jsonl"
+            else:
+                # For batch purpose, assume it's JSONL even if we can't detect from filename
+                content_type = "application/jsonl"
+        
         if hasattr(self, "_s3_object_key") is False:
             raise ValueError("S3 upload URL/object key not prepared")
 
@@ -199,23 +232,34 @@ class BedrockJsonlFilesTransformation(BaseAWSLLM):
 
         # If batch JSONL, transform OpenAI JSONL → Bedrock JSONL before upload
         payload_bytes = raw_bytes
+        bedrock_model_id = ""
+        print(f"Checking transformation conditions: purpose={create_file_data.get('purpose')}, content_type={content_type}, is_bytes={isinstance(raw_bytes, (bytes, bytearray))}")
         if (
             create_file_data.get("purpose") == "batch"
             and content_type == "application/jsonl"
             and isinstance(raw_bytes, (bytes, bytearray))
         ):
             try:
+                print(f"Starting JSONL transformation...")
                 # try infer model id from first line
                 bedrock_model_id = self.infer_model_id_from_openai_jsonl(
                     raw_bytes.decode("utf-8")
                 ) or ""
-                transformed_jsonl_str = self.transform_openai_file_content_to_bedrock_jsonl_str(raw_bytes.decode("utf-8"))
+                print(f"Inferred model ID: {bedrock_model_id}")
+                transformed_jsonl_str = self.transform_openai_file_content_to_bedrock_jsonl_str(
+                    raw_bytes.decode("utf-8")
+                )
+                print(f"Transformed JSONL: {transformed_jsonl_str[:200]}...")
                 payload_bytes = transformed_jsonl_str.encode("utf-8")
+                print(f"Transformation completed. Original size: {len(raw_bytes)}, Transformed size: {len(payload_bytes)}")
             except Exception as e:
                 verbose_logger.exception(
                     f"Error transforming batch JSONL for Bedrock: {e}"
                 )
+                print(f"Transformation failed, using original content")
                 payload_bytes = raw_bytes
+        else:
+            print(f"Skipping transformation - conditions not met")
 
         # Stash content length for response object
         self._uploaded_payload_len = len(payload_bytes)
@@ -227,6 +271,7 @@ class BedrockJsonlFilesTransformation(BaseAWSLLM):
             "content": payload_bytes,
             "content_type": content_type,
             "region": self._s3_region,
+            "model_id": getattr(self, "_model_id", "") or bedrock_model_id,
         }
     
     def transform_s3_bucket_response_to_openai_file_object(
@@ -235,6 +280,7 @@ class BedrockJsonlFilesTransformation(BaseAWSLLM):
         raw_response: Response,
         logging_obj: LiteLLMLoggingObj,
         litellm_params: dict,
+        model_id: Optional[str],
     ) -> OpenAIFileObject:
         # Build an OpenAI-like FileObject pointing to the S3 URI
         if raw_response.status_code not in (200, 201):
@@ -243,14 +289,25 @@ class BedrockJsonlFilesTransformation(BaseAWSLLM):
                 message=f"S3 upload failed with status {raw_response.status_code}: {raw_response.text}"
             )
 
-        s3_uri = (
-            f"s3://{self._s3_bucket}/{self._s3_object_key}"
-            if getattr(self, "_s3_bucket", None) and getattr(self, "_s3_object_key", None)
-            else ""
-        )
+        # Get the model_id from parameter or stored value
+        effective_model_id = model_id or getattr(self, "_model_id", "")
+        
+        # Build S3 URI - for batch files, we want the path up to the model_id folder
+        # so the batch handler can extract the model_id properly
+        if getattr(self, "_s3_bucket", None) and getattr(self, "_s3_object_key", None):
+            if effective_model_id and f"/{effective_model_id}/" in self._s3_object_key:
+                # For batch files with model_id in path, return S3 URI pointing to the model folder
+                # This allows batch handler to extract model_id: s3://bucket/path/model_id/
+                bucket_and_path = self._s3_object_key.split(f"/{effective_model_id}/")[0]
+                s3_uri = f"s3://{self._s3_bucket}/{bucket_and_path}/{effective_model_id}/" if bucket_and_path else f"s3://{self._s3_bucket}/{effective_model_id}/"
+            else:
+                # Standard S3 URI for non-batch files
+                s3_uri = f"s3://{self._s3_bucket}/{self._s3_object_key}"
+        else:
+            s3_uri = ""
         return OpenAIFileObject(
             purpose="batch",
-            id=s3_uri or self._s3_object_key,
+            id=s3_uri,
             filename=self._s3_object_key.split("/")[-1] if getattr(self, "_s3_object_key", None) else "",
             created_at=int(time.time()),
             status="uploaded",

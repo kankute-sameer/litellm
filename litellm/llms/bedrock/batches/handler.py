@@ -63,7 +63,32 @@ class BedrockBatchesAPI(BaseAWSLLM):
         from litellm.llms.bedrock.common_utils import init_bedrock_client
 
         # Derive input/output S3 URIs from the input_file_id returned by files.create
-        input_s3_uri = create_batch_data.get("input_file_id")
+        file_id = create_batch_data.get("input_file_id")
+        # The file_id is expected to be of the form f"s3://{bucket}/path/model_id/" or f"s3://{bucket}/{model_id}/"
+        # We need to extract both the input S3 URI and the model_id
+        # Example: file_id = "s3://my-bucket/path/anthropic.claude-3-sonnet-20240229-v1:0/"
+        if not isinstance(file_id, str) or not file_id.startswith("s3://"):
+            raise ValueError("input_file_id must be an s3:// URI for Bedrock batch jobs")
+        
+        # Remove the "s3://" prefix and parse the path
+        s3_path = file_id[len("s3://") :].rstrip("/")
+        path_parts = s3_path.split("/")
+        
+        if len(path_parts) < 1:
+            raise ValueError("Invalid S3 URI format")
+        
+        bucket = path_parts[0]
+        
+        # Extract model_id - it should be the last path component (folder name)
+        if len(path_parts) >= 2:
+            model_id = path_parts[-1]  # Last part is the model_id
+            # Input S3 URI is the full path up to the model_id folder
+            input_s3_uri = file_id if file_id.endswith("/") else file_id + "/"
+        else:
+            # Only bucket, no model_id
+            model_id = ""
+            input_s3_uri = f"s3://{bucket}/"
+            
         if not isinstance(input_s3_uri, str) or not input_s3_uri.startswith("s3://"):
             raise ValueError("input_file_id must be an s3:// URI for Bedrock batch jobs")
 
@@ -89,6 +114,11 @@ class BedrockBatchesAPI(BaseAWSLLM):
         if isinstance(role_arn, str) and not role_arn.startswith("arn:"):
             role_arn = None
 
+        # Ensure the model is set in the create_batch_data if we extracted it from file_id
+        if model_id and not create_batch_data.get("model"):
+            create_batch_data = dict(create_batch_data)  # Make a copy
+            create_batch_data["model"] = model_id
+            
         bedrock_job_request: CreateModelInvocationJobRequest = transform_openai_create_batch_to_bedrock_job_request(
             create_batch_data,
             s3_input_uri=input_s3_uri,
